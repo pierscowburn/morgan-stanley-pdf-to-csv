@@ -7,12 +7,17 @@
  * errors or other problems arising from this code or its usage.
  */
 
-// Usage:
+//
+// Getting the input PDF:
 //    - Go to https://shareworks.solium.com/solium/servlet/ui/activity/reports/statement				
 //    - Choose "All Available History"				
 //    - Choose "Original" rather than Full – this is important!				
-//    - Download PDF				
+//    - Download PDF and put it somewhere
+//
+// Running the script:
+//    - npm install
 //    - npx ts-node parse-statement.ts statement.pdf output.csv
+//
 
 import { execSync } from "child_process";
 import * as fs from "fs";
