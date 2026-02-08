@@ -20,6 +20,8 @@ Getting the input PDF:
   - Download PDF and put it somewhere
 
 Running the script:
-  - brew install poppler   # installs the pdftotext library
-  - npm install
-  - npx ts-node parse-statement.ts statement.pdf output.csv
+```bash
+brew install poppler   # installs the pdftotext library
+npm install
+npx ts-node parse-statement.ts statement.pdf output.csv
+```
