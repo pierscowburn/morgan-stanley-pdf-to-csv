@@ -14,6 +14,14 @@
 import { execSync } from "child_process";
 import * as fs from "fs";
 
+const saleAmountColumns = [
+  "Gross Proceeds",
+  "Wire Fee",
+  "Commission",
+  "Supplemental Transaction Fee",
+  "Net Proceeds",
+];
+
 interface Release {
   releaseDate: string;
   settlementDate: string;
@@ -24,15 +32,18 @@ interface Release {
 }
 
 interface Sale {
+  withdrawalDate: string;
   settlementDate: string;
   marketPricePerUnit: string;
   sharesSold: number;
+  amounts: string[];
 }
 
 interface ESPPPurchase {
   purchaseDate: string;
   purchasePrice: string;
   sharesPurchased: number;
+  sharesWithheld?: number;
 }
 
 interface ParsedData {
@@ -100,10 +111,11 @@ function parseReleases(text: string): Release[] {
 
 function parseSales(text: string): Sale[] {
   const sales: Sale[] = [];
-  const sections = text.split(/Withdrawal on [^\n]+/);
+  const sections = text.split(/Withdrawal on ([^\r\n]+)/);
 
-  for (let i = 1; i < sections.length; i++) {
-    const section = sections[i];
+  for (let i = 1; i < sections.length; i += 2) {
+    const headingDate = sections[i].match(/^(\w+)\s+(\d{1,2}),\s+(\d{4})\s*$/);
+    const section = sections[i + 1];
 
     const settlementDateMatch = section.match(
       /Settlement Date:\s*(\d{2}-\w{3}-\d{4})/
@@ -115,9 +127,17 @@ function parseSales(text: string): Sale[] {
 
     if (settlementDateMatch && priceMatch && sharesMatch) {
       sales.push({
+        withdrawalDate: headingDate
+          ? `${headingDate[2].padStart(2, "0")}-${headingDate[1].slice(0, 3)}-${headingDate[3]}`
+          : "",
         settlementDate: settlementDateMatch[1],
-        marketPricePerUnit: priceMatch[1],
+        marketPricePerUnit: priceMatch[1].replace(/,/g, ""),
         sharesSold: parseInt(sharesMatch[1].replace(/,/g, "")),
+        amounts: saleAmountColumns.map((label) => {
+          // Export fees as positive charges, as with the share withholding counts.
+          const amount = section.match(new RegExp(`\\b${label}:?\\s*\\$-?([\\d,.]+)\\s*USD\\b`));
+          return amount ? amount[1].replace(/,/g, "") : "";
+        }),
       });
     }
   }
@@ -128,14 +148,22 @@ function parseSales(text: string): Sale[] {
 function parseESPPPurchases(text: string): ESPPPurchase[] {
   const purchases: ESPPPurchase[] = [];
   const youBoughtPattern =
-    /(\d{2}-\w{3}-\d{4})\s+You bought\s*\$[\d.]+\s+(\d+)\s+\$([\d.]+)/g;
+    /(\d{2}-\w{3}-\d{4})[ \t]+You bought[ \t]+(?:\$[\d,.]+(?:[ \t]+USD)?[ \t]+)?([\d,]+)[ \t]+\$([\d,.]+)[^\r\n]*/g;
+  // Start at the end of the purchase row so another same-day purchase can't reuse the withholding.
+  const withheldPattern =
+    /\r?\n[ \t]*(\d{2}-\w{3}-\d{4})[ \t]+Shares Withheld for Taxes[ \t]+(?:\$-?[\d,.]+(?:[ \t]+USD)?[ \t]+)?-([\d,]+)/y;
 
   let match;
   while ((match = youBoughtPattern.exec(text)) !== null) {
+    withheldPattern.lastIndex = youBoughtPattern.lastIndex;
+    const withholding = withheldPattern.exec(text);
     purchases.push({
       purchaseDate: match[1],
-      purchasePrice: match[3],
-      sharesPurchased: parseInt(match[2]),
+      purchasePrice: match[3].replace(/,/g, ""),
+      sharesPurchased: parseInt(match[2].replace(/,/g, "")),
+      sharesWithheld: withholding && withholding[1] === match[1]
+        ? parseInt(withholding[2].replace(/,/g, ""))
+        : 0,
     });
   }
 
@@ -183,6 +211,7 @@ function toCSV(data: ParsedData): string {
     withheld: number | string;
     issued: number | string;
     sortDate: Date;
+    saleAmounts?: string[];
   }
 
   const records: Record[] = [];
@@ -203,13 +232,14 @@ function toCSV(data: ParsedData): string {
   for (const s of data.sales) {
     records.push({
       type: "Sale",
-      date: s.settlementDate,
+      date: s.withdrawalDate,
       settlementDate: s.settlementDate,
       price: s.marketPricePerUnit,
       quantity: s.sharesSold,
       withheld: "",
       issued: "",
       sortDate: parseDate(s.settlementDate),
+      saleAmounts: s.amounts,
     });
   }
 
@@ -220,19 +250,24 @@ function toCSV(data: ParsedData): string {
       settlementDate: p.purchaseDate,
       price: p.purchasePrice,
       quantity: p.sharesPurchased,
-      withheld: "",
-      issued: "",
+      withheld: p.sharesWithheld ?? "",
+      issued: p.sharesWithheld === undefined ? "" : p.sharesPurchased - p.sharesWithheld,
       sortDate: parseDate(p.purchaseDate),
     });
   }
 
   records.sort((a, b) => a.sortDate.getTime() - b.sortDate.getTime());
 
-  const lines = ["Type,Date,Settlement Date,Price,Quantity,Withheld,Issued"];
+  // Date is the statement's withdrawal date for sales. It may differ from execution.
+  const lines = [
+    ["Type", "Date", "Settlement Date", "Price", "Quantity", "Withheld", "Issued", ...saleAmountColumns].join(","),
+  ];
+  const emptySaleAmounts = saleAmountColumns.map(() => "");
   for (const r of records) {
-    lines.push(
-      `${r.type},${r.date},${r.settlementDate},${r.price},${r.quantity},${r.withheld},${r.issued}`
-    );
+    lines.push([
+      r.type, r.date, r.settlementDate, r.price, r.quantity, r.withheld, r.issued,
+      ...(r.saleAmounts ?? emptySaleAmounts),
+    ].join(","));
   }
 
   return lines.join("\n");
@@ -258,19 +293,24 @@ function toSeparateCSVs(data: ParsedData): {
   const sortedSales = [...data.sales].sort(
     (a, b) => parseDate(a.settlementDate).getTime() - parseDate(b.settlementDate).getTime()
   );
-  const salesLines = ["Settlement Date,Market Price Per Unit,Shares Sold"];
+  const salesLines = [
+    ["Settlement Date", "Market Price Per Unit", "Shares Sold", "Withdrawal Date", ...saleAmountColumns].join(","),
+  ];
   for (const s of sortedSales) {
-    salesLines.push(
-      `${s.settlementDate},${s.marketPricePerUnit},${s.sharesSold}`
-    );
+    salesLines.push([
+      s.settlementDate, s.marketPricePerUnit, s.sharesSold, s.withdrawalDate, ...s.amounts,
+    ].join(","));
   }
 
   const sortedESPP = [...data.esppPurchases].sort(
     (a, b) => parseDate(a.purchaseDate).getTime() - parseDate(b.purchaseDate).getTime()
   );
-  const esppLines = ["Purchase Date,Purchase Price,Shares Purchased"];
+  const esppLines = ["Purchase Date,Purchase Price,Shares Purchased,Withheld,Issued"];
   for (const p of sortedESPP) {
-    esppLines.push(`${p.purchaseDate},${p.purchasePrice},${p.sharesPurchased}`);
+    esppLines.push([
+      p.purchaseDate, p.purchasePrice, p.sharesPurchased, p.sharesWithheld ?? "",
+      p.sharesWithheld === undefined ? "" : p.sharesPurchased - p.sharesWithheld,
+    ].join(","));
   }
 
   return {
